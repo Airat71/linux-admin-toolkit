@@ -47,7 +47,7 @@ echo ""
 
 log "Configuration:"
 log "  Days to keep: $DAYS"
-log "  Directories to clean: ${LOG_DIRS[@]}"
+log "  Directories to clean: ${LOG_DIRS[*]}"
 echo ""
 
 # Подсчет места до очистки
