@@ -1,0 +1,44 @@
+# Серверная проверка публикаций (ADR-063, G12). Ставится в каждый публичный репо скриптом _shared/scripts/sync_public_scan.py из приватной меты;
+# руками не править: еженедельный аудит сверяет файл с шаблоном. Рядом лежит .github/scripts/public_leak_scan.py (тот же сканер, что в хуке).
+# Список запретных слов в репо не хранится: он приходит секретом LEAK_SCAN_BUNDLE (tar.gz в base64: список слов, принятые находки, исключения).
+# Журнал Actions публичный, поэтому сканер работает в режиме --ci: печатает только номер правила, категорию и короткий sha, без слов и путей.
+# Секреты не передаются в запуски из форков (docs.github.com, «Using secrets in GitHub Actions»), поэтому триггер только push; pull_request_target не используется.
+name: leak-scan
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+permissions:
+  contents: read
+concurrency:
+  group: leak-scan-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  scan:
+    # Dependabot получает только свои секреты, а его ветки меняют лишь версии зависимостей; удаление ветки сканировать нечем
+    if: github.actor != 'dependabot[bot]' && github.event.deleted == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - name: Проверка запретных слов
+        env:
+          LEAK_SCAN_BUNDLE: ${{ secrets.LEAK_SCAN_BUNDLE }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LEAK_SCAN_BUNDLE" ]; then
+            echo "::error::секрет LEAK_SCAN_BUNDLE не задан, проверка невозможна"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/scan"
+          printf '%s' "$LEAK_SCAN_BUNDLE" | base64 -d | tar -xz -C "$RUNNER_TEMP/scan"
+          python3 .github/scripts/public_leak_scan.py "$GITHUB_WORKSPACE" --ci \
+            --list "$RUNNER_TEMP/scan/public-deny-list.txt" \
+            --known "$RUNNER_TEMP/scan/public-scan-known.tsv" \
+            --allow "$RUNNER_TEMP/scan/public-scan-allow.tsv" \
+            --push "$AFTER" "$BEFORE" --ref "$REF"
