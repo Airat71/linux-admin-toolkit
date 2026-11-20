@@ -27,9 +27,10 @@
 хук считает любой код, кроме 0, блокировкой. Находки warn выводятся и код не меняют: решает человек.
 Список запретов лежит только в приватной мете: в публичные репо, их CI и README его не копировать.
 """
+import bz2
 import fnmatch
-import gzip
 import io
+import lzma
 import os
 import re
 import subprocess
@@ -37,6 +38,7 @@ import sys
 import tarfile
 import unicodedata
 import zipfile
+import zlib
 from pathlib import Path
 
 DEFAULT_LIST = Path(__file__).resolve().parents[1] / "public-deny-list.txt"
@@ -52,12 +54,20 @@ HOMOGLYPHS = str.maketrans(
      "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "Х": "X", "У": "Y", "К": "K", "І": "I", "Ѕ": "S", "Ј": "J", "М": "M", "Т": "T",
      "Н": "H", "В": "B", "Α": "A", "Ε": "E", "Ο": "O", "Ρ": "P", "Ν": "N", "Τ": "T", "Ι": "I", "Κ": "K", "Χ": "X"})
 INVISIBLE_LETTERS = {"ㅤ", "ᅟ", "ᅠ", "ﾠ"}  # буквы хангыля без видимого начертания: категория Lo, а не Cf
+CP_ALL_MAX = 8_000_000  # крупнее: из однобайтных кодировок только cp1251 (cp866 и KOI8-R дают такой же «печатный» текст из любых байтов)
+FOLD_FROM = 1_000_000  # знаков: в тексте крупнее свёртка NFKD идёт только если есть знаки из блоков, которые она меняет
+FOLD_TRIGGER = re.compile("[\u00ad\u00c0-\u036f\u0370-\u03ff\u1100-\u11ff\u1e00-\u1fff\u200b-\u200f\u202a-\u202e\u2060-\u206f\u2100-\u214f\u2460-\u24ff"
+                          "\u3000-\u303f\u3160-\u318f\ufb00-\ufb4f\ufe00-\ufe0f\ufeff\uff00-\uffef\U0001d400-\U0001d7ff]")
+LATIN = re.compile("[A-Za-z]")
+MIXED_SCRIPT = re.compile("\\b(?=\\w{1,64}\\b)\\w*(?:[A-Za-z]\\w*[\u0370-\u04ff]|[\u0370-\u04ff]\\w*[A-Za-z])\\w*")  # слово (до 64 знаков: на длинных отрезках без границ слова выражение было бы квадратичным) со смесью латиницы и кириллицы или греческого
+CP_WITH_NUL_MAX = 4_000_000  # крупный двоичный файл в cp1251 не разбираем: любые байты там «печатный» текст, разбор занимал бы десятки секунд
 OTHER_CODECS = ("cp1251", "cp866", "koi8-r")
 GIT_ENV = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}  # git replace подменяет объекты локально, а push отправляет оригиналы
 SHORT = 7
 PRINTABLE_RUN = re.compile("[^\ufffd\x00-\x08\x0b\x0c\x0e-\x1f]{4,}")  # печатные отрезки от 4 знаков (как утилита strings): самое короткое запретное слово 4 знака
 SQUEEZE_FROM = 65_536  # короче не сжимаем: номера строк в обычных файлах остаются точными
-OVERSIZE = object()  # участник архива больше MAX_BYTES: содержимое не читается, но и не пропускается молча
+CHUNK = 4_000_000  # знаков в куске при разборе большого текста
+CHUNK_OVERLAP = 256  # нахлёст кусков: слово на стыке не теряется
 CI_CATEGORIES = ("имя ветки или тега", "аннотированный тег", "заголовки коммита", "сообщение", "изменение", "имя файла")  # режим --ci печатает только эти слова
 CI_WITH_COMMIT = ("заголовки коммита", "сообщение", "изменение", "имя файла")
 PSEUDO_COMMIT, PSEUDO_REF, PSEUDO_TAG = "<коммит>", "<ссылка>", "<тег>"
@@ -120,69 +130,137 @@ def squeeze(text: str) -> str:
     return joined if len(joined) * 10 < len(text) * 7 else text
 
 
-def decode_variants(data: bytes) -> list[str]:
-    """Тексты, в которые можно прочитать байты: UTF-8, без нулевых байтов, UTF-16 и UTF-32 (с меткой порядка байтов и без, по признакам), однобайтные
-    русские кодировки. Двоичные файлы не пропускаются: слово в метаданных рисунка или в строке исполняемого файла тоже утечка. Варианты UTF-16 и UTF-32
-    без метки берутся только когда байты на них похожи (нулевые байты на одной чётности, много старших байтов 0x04 кириллицы): иначе крупный двоичный
-    файл разбирался бы в шести кодировках, и push с картинкой в десятки мегабайт тянулся минутами."""
-    if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
-        return [squeeze(data.decode("utf-32", "replace"))]
-    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return [squeeze(data.decode("utf-16", "replace"))]
+def decode_variants(data: bytes):
+    """Тексты, в которые можно прочитать байты, по одному (генератор: рядом живёт один текст, а не шесть копий 50 МБ): UTF-8, без нулевых байтов, UTF-16 и
+    UTF-32 (с меткой порядка байтов и без, по признакам), однобайтные русские кодировки. Двоичные файлы не пропускаются: слово в метаданных рисунка или в
+    строке исполняемого файла тоже утечка. UTF-16 и UTF-32 без метки берутся только когда байты на них похожи (нулевые байты на одной чётности, старшие
+    байты 0x04 кириллицы): иначе крупный двоичный файл разбирался бы в шести кодировках."""
     size = len(data)
-    texts = [data.decode("utf-8", "replace")]
+    if data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        yield squeeze(data.decode("utf-32", "replace"))
+    elif data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        yield squeeze(data.decode("utf-16", "replace"))
+    first = data.decode("utf-8", "replace")
     nuls = data.count(b"\0")
+    raw = data
+    yield squeeze(first)
     if nuls:
-        texts.append(data.replace(b"\0", b"").decode("utf-8", "replace"))
+        raw = data.replace(b"\0", b"")
+        first = raw.decode("utf-8", "replace")
+        yield squeeze(first)
         even = data[0::2].count(b"\0")
         if max(even, nuls - even) * 10 >= size:  # UTF-16 латиницей: нули на одной чётности
-            texts += [data.decode(codec, "replace") for codec in ("utf-16-le", "utf-16-be")]
+            for codec in ("utf-16-le", "utf-16-be"):
+                yield squeeze(data.decode(codec, "replace"))
         if nuls * 100 >= size * 40:  # UTF-32 латиницей: три нуля из четырёх байтов
-            texts += [data.decode(codec, "replace") for codec in ("utf-32-le", "utf-32-be")]
-    if data.count(b"\x04") * 4 >= size > 0 and not nuls * 10 >= size:  # UTF-16 с кириллицей без пробелов: старший байт 0x04
-        texts += [data.decode(codec, "replace") for codec in ("utf-16-le", "utf-16-be")]
-    if not nuls and "\ufffd" in texts[0]:  # не UTF-8: однобайтные русские кодировки
-        texts += [data.decode(codec, "replace") for codec in OTHER_CODECS]
-    return [squeeze(text) for text in texts]
+            for codec in ("utf-32-le", "utf-32-be"):
+                yield squeeze(data.decode(codec, "replace"))
+    cyrillic_high = data.count(b"\x04")
+    if cyrillic_high >= 3 and cyrillic_high * 20 >= size:  # UTF-16 с кириллицей: старший байт 0x04; смещение на байт тоже
+        sample = data[:20_000]
+        best = max(((codec, offset) for offset in (0, 1) for codec in ("utf-16-le", "utf-16-be")),
+                   key=lambda co: len(re.findall("[\u0400-\u04ff]", sample[co[1]:].decode(co[0], "replace"))))  # раскладка по образцу: полный разбор один
+        yield squeeze(data[best[1]:].decode(best[0], "replace"))
+    if "\ufffd" in first and (not nuls or size <= CP_WITH_NUL_MAX):  # не UTF-8: однобайтные русские кодировки (в двоичном контейнере поверх вырезанных нулей)
+        for codec in (OTHER_CODECS if size <= CP_ALL_MAX else OTHER_CODECS[:1]):
+            yield squeeze(raw.decode(codec, "replace"))
+
+
+_STRIP_TABLE: dict[int, None] = {}
+
+
+def strip_table() -> dict[int, None]:
+    """Знаки, которые не видны в тексте и ломают слово: форматирующие (Cf), комбинирующие (Mn, Me), невидимые буквы хангыля. Строится один раз."""
+    if not _STRIP_TABLE:
+        _STRIP_TABLE.update({cp: None for cp in range(sys.maxunicode + 1) if unicodedata.category(chr(cp)) in ("Cf", "Mn", "Me")})
+        _STRIP_TABLE.update({ord(ch): None for ch in INVISIBLE_LETTERS})
+    return _STRIP_TABLE
 
 
 def normalized(text: str) -> list[str]:
-    """Сам текст; он же в NFKC без невидимых символов и знаков комбинирования; он же с кириллическими и греческими двойниками латиницей.
-    Чистый ASCII не меняется ни одним из преобразований, его не разбирают заново."""
+    """Сам текст; он же в NFKD без невидимых символов и знаков комбинирования (акцент над буквой отделяется и вырезается: слово с акцентом равно слову без него); он же
+    с кириллическими и греческими двойниками латиницей, но только слова со смесью письменностей (чистой кириллице двойники не нужны, а проход по ней дорог).
+    Чистый ASCII не меняется ни одним из преобразований. Крупный текст без знаков из блоков, которые меняет свёртка, остаётся как есть."""
     if text.isascii():
         return [text]
-    folded = "".join(ch for ch in unicodedata.normalize("NFKC", text)
-                     if unicodedata.category(ch) not in ("Cf", "Mn", "Me") and ch not in INVISIBLE_LETTERS)
+    if len(text) > FOLD_FROM and not FOLD_TRIGGER.search(text):
+        return [text]
+    folded = unicodedata.normalize("NFKD", text).translate(strip_table())
     result = [text]
     if folded != text:
         result.append(folded)
-    mapped = folded.translate(HOMOGLYPHS)
-    if mapped != folded:
-        result.append(mapped)
+    mixed = MIXED_SCRIPT.findall(folded) if LATIN.search(folded) else []
+    if mixed:
+        result.append("\n".join(word.translate(HOMOGLYPHS) for word in mixed))
     return result
 
 
-def expand_archive(data: bytes, depth: int = 0):
-    """Содержимое zip (в том числе docx, xlsx, jar), gzip и tar внутри данных: (имя в архиве, байты). Битые и слишком вложенные пропускаются."""
-    if depth >= MAX_ARCHIVE_DEPTH:
-        return
+ARCHIVE_LIMIT = "archive-limit"
+OVERSIZE, TOO_MANY, UNREADABLE = object(), object(), object()  # участник архива: больше предела, их больше предела, не читается
+
+
+def archive_kind(data: bytes) -> str:
+    """Что это за архив по содержимому, а не по имени. zip ищется по записи в конце (так читаются и самораспаковывающиеся, и дописанные к рисунку)."""
+    if len(data) < 22:
+        return ""
+    if data[:2] == b"\x1f\x8b":
+        return "gzip"
+    if data[:3] == b"BZh":
+        return "bz2"
+    if data[:6] == b"\xfd7zXZ\x00":
+        return "xz"
+    if data[:6] == b"7z\xbc\xaf\x27\x1c" or data[:4] in (b"Rar!", b"\x28\xb5\x2f\xfd"):
+        return "unsupported"  # 7z, rar, zstd: читать нечем, но и считать чистыми нельзя
+    if data[257:262] == b"ustar":
+        return "tar"
     try:
-        if data[:4] == b"PK\x03\x04":
+        return "zip" if zipfile.is_zipfile(io.BytesIO(data)) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def bounded(decompressor, data: bytes):
+    out = decompressor.decompress(data, MAX_BYTES + 1)
+    return OVERSIZE if len(out) > MAX_BYTES else out
+
+
+def expand_archive(data: bytes, kind: str):
+    """Содержимое архива: (имя в архиве, байты). Вместо байтов маркеры OVERSIZE, TOO_MANY, UNREADABLE: молча пропущенный участник был бы дырой."""
+    try:
+        if kind == "zip":
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                for info in zf.infolist()[:MAX_ARCHIVE_MEMBERS]:
-                    if not info.is_dir():
-                        yield info.filename, (zf.read(info) if info.file_size <= MAX_BYTES else OVERSIZE)
-        elif data[:2] == b"\x1f\x8b":
-            with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
-                yield "gz", gz.read(MAX_BYTES + 1)[:MAX_BYTES]
-        elif data[257:262] == b"ustar":
+                infos = zf.infolist()
+                for info in infos[:MAX_ARCHIVE_MEMBERS]:
+                    if info.is_dir():
+                        continue
+                    if info.file_size > MAX_BYTES:
+                        yield info.filename, OVERSIZE
+                        continue
+                    try:
+                        yield info.filename, zf.read(info)
+                    except (zipfile.BadZipFile, zlib.error, RuntimeError, NotImplementedError, EOFError, OSError):
+                        yield info.filename, UNREADABLE  # повреждён, зашифрован или неизвестный способ сжатия
+                if len(infos) > MAX_ARCHIVE_MEMBERS:
+                    yield "…", TOO_MANY
+        elif kind == "gzip":
+            yield "gz", bounded(zlib.decompressobj(31), data)
+        elif kind == "bz2":
+            yield "bz2", bounded(bz2.BZ2Decompressor(), data)
+        elif kind == "xz":
+            yield "xz", bounded(lzma.LZMADecompressor(), data)
+        elif kind == "tar":
             with tarfile.open(fileobj=io.BytesIO(data)) as tf:
-                for member in tf.getmembers()[:MAX_ARCHIVE_MEMBERS]:
+                members = tf.getmembers()
+                for member in members[:MAX_ARCHIVE_MEMBERS]:
                     if member.isfile():
                         extracted = tf.extractfile(member) if member.size <= MAX_BYTES else None
                         yield member.name, (extracted.read() if extracted else OVERSIZE)
-    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, RuntimeError, NotImplementedError):
-        return
+                if len(members) > MAX_ARCHIVE_MEMBERS:
+                    yield "…", TOO_MANY
+        else:
+            yield "", UNREADABLE
+    except (zipfile.BadZipFile, tarfile.TarError, zlib.error, lzma.LZMAError, OSError, EOFError, ValueError, RuntimeError, NotImplementedError):
+        yield "", UNREADABLE
 
 
 class Report:
@@ -202,8 +280,26 @@ class Report:
             if level == "error" and path and path not in self.hit_paths:
                 self.hit_paths.append(path)
 
+    def limit(self, name: str, where: str, path: str, why: str) -> None:
+        """Находка «не проверено»: предел размера, глубины, числа участников или нечитаемый архив. Снимается исключением по имени и пути с причиной."""
+        if not allowed(name, path, self.allow):
+            self.add("error", name, f"{where}: {why}", path)
+
     def check_text(self, text: str, where: str, path: str, lines: bool) -> None:
-        """where: что печатать в находке; path: что сопоставлять с масками исключений; lines: называть номер строки совпадения."""
+        """where: что печатать в находке; path: что сопоставлять с масками исключений; lines: называть номер строки совпадения.
+        Большой текст разбирается кусками по 4 млн знаков с нахлёстом, чтобы нормализация не держала в памяти по копии на весь текст."""
+        if len(text) > CHUNK:
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + CHUNK)
+                self._check_text(text[start:end], where, path, lines, text.count("\n", 0, start))
+                if end == len(text):
+                    break
+                start = end - CHUNK_OVERLAP
+            return
+        self._check_text(text, where, path, lines, 0)
+
+    def _check_text(self, text: str, where: str, path: str, lines: bool, offset: int) -> None:
         variants = [v for v in normalized(text) if self.any_rule.search(v)]  # один раз на текст; без совпадений дальше не идём
         if not variants:
             return
@@ -216,7 +312,7 @@ class Report:
                     if shown >= LINES_PER_RULE:
                         break
                     shown += 1
-                    place = f"{where}:{variant.count(chr(10), 0, match.start()) + 1}" if lines else where
+                    place = f"{where}:{offset + variant.count(chr(10), 0, match.start()) + 1}" if lines else where
                     self.add(level, name, f"{place}: {match.group(0)[:60]}", path)
                     if not lines:
                         break
@@ -225,25 +321,36 @@ class Report:
 
     def check_blob(self, data: bytes, where: str, path: str, depth: int = 0) -> None:
         if len(data) > MAX_BYTES:
-            if not allowed("size-limit", path, self.allow):
-                self.add("error", "size-limit", f"{where}: файл больше {MAX_BYTES // 1_000_000} МБ, не проверен", path)
+            self.limit("size-limit", where, path, f"файл больше {MAX_BYTES // 1_000_000} МБ, не проверен")
             return
         for text in decode_variants(data):
             self.check_text(text, where, path, lines=True)
+        kind = archive_kind(data)
+        if not kind:
+            return
+        if depth >= MAX_ARCHIVE_DEPTH:
+            self.limit(ARCHIVE_LIMIT, where, path, f"архив вложен глубже {MAX_ARCHIVE_DEPTH} уровней, не проверен до конца")
+            return
         if depth == 0:
             self.archive_left = MAX_ARCHIVE_TOTAL
-        for member, content in expand_archive(data, depth):
+        for member, content in expand_archive(data, kind):
+            label = f"{where} (в архиве, {member})" if member else f"{where} (в архиве)"
             if content is OVERSIZE:
-                if not allowed("size-limit", path, self.allow):
-                    self.add("error", "size-limit", f"{where} (в архиве, {member}): файл больше {MAX_BYTES // 1_000_000} МБ, не проверен", path)
+                self.limit("size-limit", label, path, f"файл больше {MAX_BYTES // 1_000_000} МБ, не проверен")
+                continue
+            if content is TOO_MANY:
+                self.limit(ARCHIVE_LIMIT, where, path, f"в архиве больше {MAX_ARCHIVE_MEMBERS} участников, остальные не проверены")
+                continue
+            if content is UNREADABLE:
+                self.limit(ARCHIVE_LIMIT, label, path, "архив не читается (повреждён, зашифрован или формат не поддерживается), не проверен")
                 continue
             self.archive_left -= len(content)
             if self.archive_left < 0:
-                if not allowed("size-limit", path, self.allow):
-                    self.add("error", "size-limit", f"{where}: архив разворачивается больше {MAX_ARCHIVE_TOTAL // 1_000_000} МБ, не проверен до конца", path)
+                self.limit("size-limit", where, path, f"архив разворачивается больше {MAX_ARCHIVE_TOTAL // 1_000_000} МБ, не проверен до конца")
                 return
-            self.check_text(member, f"{where} (в архиве, имя {member})", path, lines=False)
-            self.check_blob(content, f"{where} (в архиве, {member})", path, depth + 1)
+            for text in decode_variants(member.encode("utf-8", "replace")):
+                self.check_text(text, f"{where} (в архиве, имя {member})", path, lines=False)
+            self.check_blob(content, label, path, depth + 1)
 
 
 def read_objects(repo: Path, oids: list[str]):
@@ -264,10 +371,12 @@ def read_objects(repo: Path, oids: list[str]):
 
 
 def scan_files(repo: Path, report: Report) -> None:
-    for rel in git(repo, "ls-files", "-z").split("\0"):
-        if not rel:
+    for raw_name in git(repo, "ls-files", "-z", raw=True).split(b"\0"):
+        if not raw_name:
             continue
-        report.check_text(rel, f"имя файла {rel}", rel, lines=False)
+        rel = raw_name.decode("utf-8", "replace")
+        for text in decode_variants(raw_name):  # имя файла в cp1251 тоже имя
+            report.check_text(text, f"имя файла {rel}", rel, lines=False)
         path = repo / rel
         if path.is_file() and not path.is_symlink():
             report.check_blob(path.read_bytes(), rel, rel)
@@ -287,30 +396,33 @@ def check_commit_objects(repo: Path, commits: list[str], report: Report, how: st
             report.check_text(text, f"{how}, сообщение: {short} {subject}", PSEUDO_COMMIT, lines=False)
 
 
-def changed_blobs(repo: Path, commits: list[str]) -> list[tuple[str, str, str, str]]:
-    """(коммит, oid файла, путь, режим) для каждого файла, добавленного или изменённого каждым коммитом. diff-tree -m даёт и merge-коммиты (diff
-    против каждого родителя, в нём результат разрешения конфликта), --root корневой, -z пути без экранирования (имя с переводом строки приходит
-    целиком), коммиты идут от старых к новым: файл приписан коммиту, который его ввёл."""
+def changed_blobs(repo: Path, commits: list[str]) -> list[tuple[str, str, bytes, str]]:
+    """(коммит, oid файла, путь байтами, режим) для каждого файла, добавленного или изменённого каждым коммитом. diff-tree -m даёт и merge-коммиты (diff
+    против каждого родителя, в нём результат разрешения конфликта), --root корневой, -z пути без экранирования (имя с переводом строки или в cp1251 приходит
+    целиком, поэтому путь остаётся байтами), коммиты идут от старых к новым: файл приписан коммиту, который его ввёл."""
     if not commits:
         return []
     done = subprocess.run(["git", "-C", str(repo), "diff-tree", "--stdin", "-z", "-m", "--root", "-r", "--no-renames", "--no-abbrev"],
-                          input="\n".join(commits) + "\n", capture_output=True, text=True, errors="replace", env=GIT_ENV)
+                          input=("\n".join(commits) + "\n").encode(), capture_output=True, env=GIT_ENV)
     if done.returncode != 0:
-        raise ScanError(f"git diff-tree: {done.stderr.strip()[:200]}")
-    tokens = done.stdout.split("\0")
-    result, seen, commit, index = [], set(), "", 0
+        raise ScanError(f"git diff-tree: {done.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    tokens = done.stdout.split(b"\0")
+    result: list[tuple[str, str, bytes, str]] = []
+    seen: set[tuple[str, bytes]] = set()
+    commit, index = "", 0
     while index < len(tokens):
-        token = tokens[index].strip("\n")
-        if token.startswith(":") and index + 1 < len(tokens):
-            fields = token.split()
+        token = tokens[index].strip(b"\n")
+        if token.startswith(b":") and index + 1 < len(tokens):
+            fields = token.decode("ascii", "replace").split()
             path = tokens[index + 1]
             index += 2
             if len(fields) >= 5 and set(fields[3]) != {"0"} and (fields[3], path) not in seen:
                 seen.add((fields[3], path))
                 result.append((commit[:SHORT], fields[3], path, fields[1]))
             continue
-        if re.fullmatch(r"[0-9a-f]{40}", token.split(" ")[0] if token else ""):
-            commit = token.split(" ")[0]
+        head = token.split(b" ")[0].decode("ascii", "replace")
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            commit = head
         index += 1
     return result
 
@@ -319,8 +431,10 @@ def walk(repo: Path, revargs: list[str], report: Report, how: str) -> None:
     commits = git(repo, "rev-list", "--reverse", *revargs).split()
     check_commit_objects(repo, commits, report, how)
     entries = changed_blobs(repo, commits)
-    for (commit, _oid, path, mode), (kind, data) in zip(entries, read_objects(repo, [e[1] for e in entries])):
-        report.check_text(path, f"{how}, имя файла: {commit} {path}", path, lines=False)
+    for (commit, _oid, raw_path, mode), (kind, data) in zip(entries, read_objects(repo, [e[1] for e in entries])):
+        path = raw_path.decode("utf-8", "replace")
+        for text in decode_variants(raw_path):  # имя файла в cp1251 тоже имя
+            report.check_text(text, f"{how}, имя файла: {commit} {path}", path, lines=False)
         if mode != "160000" and kind == "blob" and data is not None:  # 160000: подмодуль, указатель на чужой коммит, не файл
             report.check_blob(data, f"{how}, изменение: {commit} {path}", path)
 
@@ -335,9 +449,10 @@ def peel(repo: Path, oid: str, report: Report) -> tuple[str, str]:
         kind = git(repo, "cat-file", "-t", oid, check=False).strip()
         if kind != "tag":
             return oid, kind
-        text = git(repo, "cat-file", "-p", oid)
-        report.check_text(text, f"push, аннотированный тег {oid[:SHORT]}", PSEUDO_TAG, lines=False)
-        target = re.search(r"^object ([0-9a-f]{40})", text, re.M)
+        raw_tag = git(repo, "cat-file", "tag", oid, raw=True)  # сырой объект: сообщение тега может быть в любой кодировке
+        for text in decode_variants(raw_tag):
+            report.check_text(text, f"push, аннотированный тег {oid[:SHORT]}", PSEUDO_TAG, lines=False)
+        target = re.search(r"^object ([0-9a-f]{40})", raw_tag.decode("ascii", "replace"), re.M)
         if not target:
             return oid, "tag"
         oid = target.group(1)
@@ -352,6 +467,8 @@ def scan_push(repo: Path, pairs: list[tuple[str, str]], refs: list[str], report:
     positives, negatives = [], []
     for local, remote in pairs:
         target, kind = peel(repo, local, report)
+        if kind not in ("commit", "blob", "tree"):  # sha не найден или объект непонятный: проверить нечего, а «нечего» не значит «чисто»
+            raise ScanError(f"объект {local[:12]} не читается (тип {kind or 'не найден'}): проверка невозможна")
         if kind in ("blob", "tree"):  # тег или ветка на файл или каталог: содержимое читается напрямую
             objects = [line.split(" ", 1) for line in git(repo, "rev-list", "--objects", target).splitlines() if line.strip()]
             for (oid, *name), (otype, data) in zip(objects, read_objects(repo, [o[0] for o in objects])):
